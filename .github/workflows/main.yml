@@ -1,0 +1,178 @@
+name: 🚀 WINDOWS RDP - MAX SPECS (PUBLIC REPO)
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_hours:
+        description: '⏱️ Session Duration (Max 6 hours allowed by GitHub)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+
+jobs:
+  secure-rdp:
+    # ⚠️ To get 4 Cores / 16GB RAM, this repo MUST be Public.
+    runs-on: windows-latest
+    timeout-minutes: 359 # Max is 360, keeping it at 359 prevents hard-kill
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize Disk Space (Fast Method)
+        shell: pwsh
+        run: |
+          Write-Host "Disk space BEFORE cleanup:" -ForegroundColor Cyan
+          Get-PSDrive C | Select-Object Used,Free
+          Write-Host "Deleting unneeded pre-installed SDKs (Fast)..." -ForegroundColor Yellow
+          cmd.exe /c "rd /s /q C:\Program Files\Android" 2>$null
+          cmd.exe /c "rd /s /q C:\Program Files (x86)\Android" 2>$null
+          cmd.exe /c "rd /s /q C:\Program Files\dotnet" 2>$null
+          cmd.exe /c "rd /s /q C:\hostedtoolcache" 2>$null
+          cmd.exe /c "rd /s /q C:\ProgramData\chocolatey" 2>$null
+          cmd.exe /c "rd /s /q C:\Program Files\Microsoft SDKs" 2>$null
+          cmd.exe /c "rd /s /q C:\Windows\Temp" 2>$null
+          cmd.exe /c "rd /s /q %TEMP%" 2>$null
+          Write-Host "Disk space AFTER cleanup:" -ForegroundColor Green
+          Get-PSDrive C | Select-Object Used,Free
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          function New-SecurePassword {
+              param([int]$Length = 16)
+              $charSets = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,94,95)
+              }
+              $passwordChars = @()
+              $passwordChars += $charSets.Upper | Get-Random -Count 4
+              $passwordChars += $charSets.Lower | Get-Random -Count 4
+              $passwordChars += $charSets.Number | Get-Random -Count 4
+              $passwordChars += $charSets.Special | Get-Random -Count 4
+              return (-join ($passwordChars | Sort-Object { Get-Random }))
+          }
+          $password = New-SecurePassword
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          try {
+              New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member "RDPUser" -ErrorAction Stop
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser" -ErrorAction Stop
+              echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+              echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          } catch {
+              Write-Error "User creation failed: $($_.Exception.Message)"
+              exit 1
+          }
+
+      - name: Install & Connect Tailscale (EXE Method)
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # 1. Download and Install using the .exe installer (more reliable than MSI)
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          
+          # 2. Run silent install
+          Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait -NoNewWindow
+          Start-Sleep -Seconds 10
+
+          # 3. Dynamically locate tailscale.exe (Primary + Fallback paths)
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) { $tsExe = "C:\Program Files (x86)\Tailscale\tailscale.exe" }
+          if (-not (Test-Path $tsExe)) { 
+              $tsCmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+              if ($tsCmd) { $tsExe = $tsCmd.Source }
+          }
+          if (-not $tsExe -or -not (Test-Path $tsExe)) { Write-Error "Could not locate tailscale.exe. Install failed."; exit 1 }
+          Write-Host "Found Tailscale at: $tsExe"
+
+          # 4. Start Service
+          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          # 5. Connect (--unattended is required for headless runners)
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --unattended
+
+          # 6. Fetch IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & $tsExe ip -4 2>$null
+              if (-not $tsIP) { Start-Sleep -Seconds 5; $retries++ }
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Display Connection Information
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "🟢 RDP IS READY TO CONNECT" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Tailscale Address: $env:TAILSCALE_IP" -ForegroundColor Yellow
+          Write-Host "Username: $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host "Port: 3389" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Disk Space Available:" -ForegroundColor Cyan
+          Get-PSDrive C | Select-Object Used,Free
+          Write-Host ""
+
+      - name: Maintain Connection
+        shell: pwsh
+        env:
+          SESSION_HOURS: ${{ inputs.session_hours }}
+        run: |
+          Write-Host "Maintaining RDP connection..."
+          $totalSeconds = ([int]$env:SESSION_HOURS * 3600) - 300
+          $startTime = Get-Date
+          while ($true) {
+              $elapsed = ((Get-Date) - $startTime).TotalSeconds
+              $remaining = $totalSeconds - $elapsed
+              if ($remaining -le 0) {
+                  Write-Host "Session time limit reached. Shutting down RDP."
+                  break
+              }
+              $remainingMin = [math]::Round($remaining / 60)
+              Write-Host "RDP session active - Time remaining: $remainingMin minutes"
+              
+              $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+              if (-not (Test-Path $tsExe)) { $tsExe = "C:\Program Files (x86)\Tailscale\tailscale.exe" }
+              if (-not (Test-Path $tsExe)) { 
+                  $tsCmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+                  if ($tsCmd) { $tsExe = $tsCmd.Source }
+              }
+              
+              if ($tsExe -and (Test-Path $tsExe)) {
+                  $tsStatus = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+                  if (-not $tsStatus -or $tsStatus.BackendState -ne "Running") {
+                      Write-Error "Tailscale connection lost. Exiting."
+                      exit 1
+                  }
+              }
+              
+              Start-Sleep -Seconds 300
+          }
